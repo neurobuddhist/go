@@ -18,15 +18,33 @@ import (
 //
 // See package [sync.Mutex] documentation.
 type Mutex struct {
+	// Состояние мьютекса закодировано в битах: 29 на waiter и старшие 3 для Locked, Woken, Starving.
+	// 000..00 - 29 битов для отслеживания сколько горутин ожидают мьютекс и 000 для состояний мьютекса.
+	// Рантаймовый семафор хранит очередь ожидающих горутин,
+	// но 29 битов в state позволяет принимать быстрые решения без похода в рантайм.
+	// Также state поддерживает атомарные операции и в lockSlow() проще менять данные через него.
 	state int32
-	sema  uint32
+	sema  uint32 // Ручка для парковки/разбудки горутин через рантаймовый семафор.
 }
 
+// Нюанс №1: Мьютексы не хранят владельца блокировки, блокировку можно снять другой горутиной. В отличии от мьютекса ОС Linux, например.
+
 const (
-	mutexLocked = 1 << iota // mutex is locked
+	// Мьютекс сейчас захвачен.
+	mutexLocked      = 1 << iota // mutex is locked
+	// Какую-то горутину уже будят, будить остальные не нужно.
 	mutexWoken
+	// Мьютекс голодает.
+	// Это специальный режим, который позволяет горутинам не голодать и включается если горутина ждала дольше 1ms.
 	mutexStarving
+	//
 	mutexWaiterShift = iota
+
+	// То есть:
+	// бит 0 (mutexLocked=1) - устанавливается в 1, если мьютекс заблокирован в данный момент.
+	// бит 1 (mutexWoken=2) - устанавливается в 1, если какая-либо горутина была разбужена и пытается захватить мьютекс. Остальные будить не нужно.
+	// бит 2 (mutexStarving=4) - устанавливается в 1, если мьютекс голодает .
+	// старшие биты (сдвиг mutexWaiterShift == 3) - отслеживают количество ожидающих горутин.
 
 	// Mutex fairness.
 	//
@@ -60,19 +78,26 @@ const (
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Lock() {
 	// Fast path: grab unlocked mutex.
+	// CAS - операция обновления значения с A на B, которая выполняется если в ячейке лежит A = <что-то>.
+	// Здесь мы пытаемся захватить свободный мьютекс.
 	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		// Штука для race detector.
 		if race.Enabled {
 			race.Acquire(unsafe.Pointer(m))
 		}
 		return
 	}
 	// Slow path (outlined so that the fast path can be inlined)
+	// Если CAS не прошёл - мьютекс кто-то держит или он голодает.
 	m.lockSlow()
 }
 
 // TryLock tries to lock m and reports whether it succeeded.
 //
 // See package [sync.Mutex] documentation.
+// Чуть более быстрый, но менее справедливый метод взятия блокировки,
+// способный "украсть" её у горутины, которую начали будить.
+// Это best effort-операция.
 func (m *Mutex) TryLock() bool {
 	old := m.state
 	if old&(mutexLocked|mutexStarving) != 0 {
@@ -93,11 +118,13 @@ func (m *Mutex) TryLock() bool {
 }
 
 func (m *Mutex) lockSlow() {
-	var waitStartTime int64
-	starving := false
-	awoke := false
-	iter := 0
-	old := m.state
+	// Это поля значений горутины, которые нужны для выбора стратегии lockSlow().
+
+	var waitStartTime int64 // Момент времени, в который горутина впервые уснула на семафоре.
+	starving := false // Голодает ли горутина?
+	awoke := false    // Будили ли горутину?
+	iter := 0         // Сколько раз горутина уже крутилась на этой попытке??
+	old := m.state    // Снимок состояния.
 	for {
 		// Don't spin in starvation mode, ownership is handed off to waiters
 		// so we won't be able to acquire the mutex anyway.
@@ -147,6 +174,8 @@ func (m *Mutex) lockSlow() {
 				waitStartTime = runtime_nanotime()
 			}
 			runtime_SemacquireMutex(&m.sema, queueLifo, 2)
+
+			// Проставляем режим голодания если ждём больше 1ms.
 			starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
 			old = m.state
 			if old&mutexStarving != 0 {
@@ -191,7 +220,11 @@ func (m *Mutex) Unlock() {
 	}
 
 	// Fast path: drop lock bit.
+	// -mutexLocked = -1, это позволяет снять бит "мьютекс заблокирован", не затронув остальные биты.
 	new := atomic.AddInt32(&m.state, -mutexLocked)
+
+	// Если после снятия блокировки остались ненулевые биты - надо разбираться.
+	// Например в waiters кто-то остался || было голодание || кого-то будят // всё вместе.
 	if new != 0 {
 		// Outlined slow path to allow inlining the fast path.
 		// To hide unlockSlow during tracing we skip one extra frame when tracing GoUnblock.
@@ -199,12 +232,17 @@ func (m *Mutex) Unlock() {
 	}
 }
 
+// Отвечает за 2 сценария: мьютекс в обычном режиме и мьютекс в режие голодания.
 func (m *Mutex) unlockSlow(new int32) {
+	// Анлок мьютекса без блокировки -> паника.
 	if (new+mutexLocked)&mutexLocked == 0 {
 		fatal("sync: unlock of unlocked mutex")
 	}
+
+	// Сценарий мьютекса в нормальном режиме.
 	if new&mutexStarving == 0 {
 		old := new
+		// Цикл чтобы eventually выиграть CAS.
 		for {
 			// If there are no waiters or a goroutine has already
 			// been woken or grabbed the lock, no need to wake anyone.
@@ -212,12 +250,16 @@ func (m *Mutex) unlockSlow(new int32) {
 			// goroutine to the next waiter. We are not part of this chain,
 			// since we did not observe mutexStarving when we unlocked the mutex above.
 			// So get off the way.
+
+			// Нет waiters || (кто-то заново взял блокировку || кого-то будят || включился режим голодания) -> выходим.
 			if old>>mutexWaiterShift == 0 || old&(mutexLocked|mutexWoken|mutexStarving) != 0 {
 				return
 			}
 			// Grab the right to wake someone.
+			// Уменьшаем счётчик waiters на 1 и ставим бит Woken в 1.
 			new = (old - 1<<mutexWaiterShift) | mutexWoken
 			if atomic.CompareAndSwapInt32(&m.state, old, new) {
+				// Будим горутину через рантаймовый семафор, false -> пробуждение не в голодании и без handoff.
 				runtime_Semrelease(&m.sema, false, 2)
 				return
 			}
@@ -229,6 +271,9 @@ func (m *Mutex) unlockSlow(new int32) {
 		// Note: mutexLocked is not set, the waiter will set it after wakeup.
 		// But mutex is still considered locked if mutexStarving is set,
 		// so new coming goroutines won't acquire it.
+
+		// Будим горутину через рантаймовый семафор, true -> пробуждение в режиме голодании и с handoff.
+		// Handoff - передача ownership конкретной горутине воизбежание tail-latency.
 		runtime_Semrelease(&m.sema, true, 2)
 	}
 }
